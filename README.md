@@ -3,7 +3,7 @@
         BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Imagery as Deterministic Continuous Evolution
     </h2>
     <p>
-        <a href="https://qwerasdzxhjk.github.io">Taochang Liu</a>, <a href="http://www.sysuzxc.site">Xinchang Zhang</a>, <a href="https://scholar.google.com/citations?hl=zh-CN&user=gnUd7ywAAAAJ">Ji Qi<sup>*</sup></a>, <a href="https://geo.gzhu.edu.cn/info/1176/4090.htm">Yongjian Ruan</a>, Linrui Xu and<a href="https://faculty.csu.edu.cn/lihaifeng/zh_CN/index.htm">Haifeng Li</a>
+        <a href="https://qwerasdzxhjk.github.io">Taochang Liu</a>, <a href="http://www.sysuzxc.site">Xinchang Zhang</a>, <a href="https://scholar.google.com/citations?hl=zh-CN&user=gnUd7ywAAAAJ">Ji Qi<sup>*</sup></a>, <a href="https://geo.gzhu.edu.cn/info/1176/4090.htm">Yongjian Ruan</a>, Linrui Xu and <a href="https://faculty.csu.edu.cn/lihaifeng/zh_CN/index.htm">Haifeng Li</a>
     </p>
 </div>
 
