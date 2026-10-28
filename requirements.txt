@@ -1,36 +1,15 @@
-diffusers==0.29.0
-transformers==4.38.0
-accelerate==1.10.1
-peft==0.5.0
-timm==1.0.20
-tokenizers==0.15.2
-einops==0.8.1
-safetensors==0.6.2
-sentencepiece==0.2.1
+# Reference environment: Python 3.10, PyTorch 2.1.2 + CUDA 12.1.
+# Install PyTorch separately, e.g.:
+#   pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
 numpy==1.26.0
-scipy==1.15.3
-scikit-learn==1.7.2
-scikit-image==0.25.2
-tifffile==2025.5.10
-pillow==11.0.0
-networkx==3.3
-sympy==1.13.3
-swanlab
-wandb
-boto3
-requests
-tqdm
-click
-rich
-pyecharts
-beautifulsoup4
-PyYAML
-regex
-fsspec
-huggingface-hub
-GitPython
-torchdiffeq
-open_clip_torch
+einops==0.8.1
+timm==1.0.20
+peft==0.5.0
+transformers==4.38.0
 ml_collections
 absl-py
 opencv-python
+scikit-image==0.25.2
+pillow==11.0.0
+tqdm
+matplotlib

@@ -1,7 +1,18 @@
+"""Feature-probe analysis of the image-to-mask transformation trajectory.
+
+Compares pixel-space and latent-space (VAE) linear interpolations between an
+input RSI and its building mask, and reports Shannon entropy per region,
+Laplacian sharpness, and total variation along the trajectory (paper Fig. 1
+and Fig. 8). Saves per-image CSV tables, plots, and interpolation frames.
+"""
+
 import os
 
-# Set the CUDA device.
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Set the CUDA device (override with BUILD_FLOW_CUDA_VISIBLE_DEVICES).
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get(
+    'BUILD_FLOW_CUDA_VISIBLE_DEVICES',
+    os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
+)
 
 from pathlib import Path
 import collections

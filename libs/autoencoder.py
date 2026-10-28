@@ -1,26 +1,9 @@
+"""Frozen KL-regularized VAE (CrossFlow assets) mapping between pixel space
+and latent space."""
+
 import torch
 import torch.nn as nn
 import numpy as np
-from einops import rearrange
-
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x)
-        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3)
-        k = k.softmax(dim=-1)
-        context = torch.einsum('bhdn,bhen->bhde', k, v)
-        out = torch.einsum('bhde,bhdn->bhen', context, q)
-        out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
-        return self.to_out(out)
 
 
 def nonlinearity(x):
@@ -134,12 +117,6 @@ class ResnetBlock(nn.Module):
         return x+h
 
 
-class LinAttnBlock(LinearAttention):
-    """to match AttnBlock usage"""
-    def __init__(self, in_channels):
-        super().__init__(dim=in_channels, heads=1, dim_head=in_channels)
-
-
 class AttnBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -195,24 +172,16 @@ class AttnBlock(nn.Module):
         return x+h_
 
 
-def make_attn(in_channels, attn_type="vanilla"):
-    assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
-    print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
-    if attn_type == "vanilla":
-        return AttnBlock(in_channels)
-    elif attn_type == "none":
-        return nn.Identity(in_channels)
-    else:
-        return LinAttnBlock(in_channels)
+def make_attn(in_channels):
+    return AttnBlock(in_channels)
 
 
 class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, double_z=True, use_linear_attn=False, attn_type="vanilla",
+                 resolution, z_channels, double_z=True,
                  **ignore_kwargs):
         super().__init__()
-        if use_linear_attn: attn_type = "linear"
         self.ch = ch
         self.temb_ch = 0
         self.num_resolutions = len(ch_mult)
@@ -243,7 +212,7 @@ class Encoder(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(block_in))
             down = nn.Module()
             down.block = block
             down.attn = attn
@@ -258,7 +227,7 @@ class Encoder(nn.Module):
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+        self.mid.attn_1 = make_attn(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -303,10 +272,9 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
-                 attn_type="vanilla", **ignorekwargs):
+                 resolution, z_channels, give_pre_end=False, tanh_out=False,
+                 **ignorekwargs):
         super().__init__()
-        if use_linear_attn: attn_type = "linear"
         self.ch = ch
         self.temb_ch = 0
         self.num_resolutions = len(ch_mult)
@@ -321,6 +289,8 @@ class Decoder(nn.Module):
         block_in = ch*ch_mult[self.num_resolutions-1]
         curr_res = resolution // 2**(self.num_resolutions-1)
         self.z_shape = (1,z_channels,curr_res,curr_res)
+        print("Working with z of shape {} = {} dimensions.".format(
+            self.z_shape, np.prod(self.z_shape)))
 
         # z to block_in
         self.conv_in = torch.nn.Conv2d(z_channels,
@@ -335,7 +305,7 @@ class Decoder(nn.Module):
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
+        self.mid.attn_1 = make_attn(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -354,7 +324,7 @@ class Decoder(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(block_in))
             up = nn.Module()
             up.block = block
             up.attn = attn
@@ -418,7 +388,6 @@ class FrozenAutoencoderKL(nn.Module):
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
         self.scale_factor = scale_factor
-        self._has_logged_runtime_z_shape = False
         m, u = self.load_state_dict(torch.load(pretrained_path, map_location='cpu'))
         assert len(m) == 0 and len(u) == 0
         self.eval()
@@ -435,11 +404,6 @@ class FrozenAutoencoderKL(nn.Module):
         std = torch.exp(0.5 * logvar)
         z = mean + std * torch.randn_like(mean)
         z = self.scale_factor * z
-        if not self._has_logged_runtime_z_shape:
-            sample_z_shape = (1, *z.shape[1:])
-            print("Working with runtime z shape {} = {} dimensions.".format(
-                sample_z_shape, int(np.prod(sample_z_shape))))
-            self._has_logged_runtime_z_shape = True
         return z
 
     def encode(self, x):
@@ -478,46 +442,3 @@ def get_model(pretrained_path, scale_factor=0.18215):
         dropout=0.0
     )
     return FrozenAutoencoderKL(ddconfig, 4, pretrained_path, scale_factor)
-
-
-def main():
-    import torchvision.transforms as transforms
-    from torchvision.utils import save_image
-    import os
-    from PIL import Image
-
-    model = get_model('assets/stable-diffusion/autoencoder_kl.pth')
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model = model.to(device)
-
-    scale_factor = 0.18215
-    T = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor()])
-    path = 'imgs'
-    fnames = os.listdir(path)
-    for fname in fnames:
-        p = os.path.join(path, fname)
-        img = Image.open(p)
-        img = T(img)
-        img = img * 2. - 1
-        img = img[None, ...]
-        img = img.to(device)
-
-        # with torch.cuda.amp.autocast():
-        #     moments = model.encode_moments(img)
-        #     mean, logvar = torch.chunk(moments, 2, dim=1)
-        #     logvar = torch.clamp(logvar, -30.0, 20.0)
-        #     std = torch.exp(0.5 * logvar)
-        #     zs = [(mean + std * torch.randn_like(mean)) * scale_factor for _ in range(4)]
-        #     recons = [model.decode(z) for z in zs]
-
-        with torch.cuda.amp.autocast():
-            print('test encode & decode')
-            recons = [model.decode(model.encode(img)) for _ in range(4)]
-
-        out = torch.cat([img, *recons], dim=0)
-        out = (out + 1) * 0.5
-        save_image(out, f'recons_{fname}')
-
-
-if __name__ == "__main__":
-    main()

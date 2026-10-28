@@ -1,9 +1,10 @@
 <div align="center">
     <h2>
-        BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Imagery as Deterministic Continuous Evolution
+        BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Images as Deterministic Continuous Evolution
     </h2>
     <p>
-        <a href="https://qwerasdzxhjk.github.io">Taochang Liu</a>, <a href="http://www.sysuzxc.site">Xinchang Zhang</a>, <a href="https://geo.gzhu.edu.cn/info/1174/2184.htm">Jianzhou Gong<sup>*</sup></a>, <a href="https://scholar.google.com/citations?hl=zh-CN&user=gnUd7ywAAAAJ">Ji Qi<sup>*</sup></a> <a href="https://geo.gzhu.edu.cn/info/1176/4090.htm">Yongjian Ruan</a> Linrui Xu <a href="https://faculty.csu.edu.cn/lihaifeng/zh_CN/index.htm">Haifeng Li</a>
+        <a href="https://qwerasdzxhjk.github.io">Taochang Liu</a>, <a href="http://www.sysuzxc.site">Xinchang Zhang</a>, <a href="https://scholar.google.com/citations?hl=zh-CN&user=gnUd7ywAAAAJ">Ji Qi<sup>*</sup></a>, <a href="https://geo.gzhu.edu.cn/info/1176/4090.htm">Yongjian Ruan</a>, Linrui Xu, <a href="https://sysu-3dstailab.github.io/3DSTAILab">Yiping Chen</a> and <a href="https://faculty.csu.edu.cn/lihaifeng/zh_CN/index.htm">Haifeng Li</a>
+        <br><sup>*</sup> Corresponding author.
     </p>
 </div>
 
@@ -13,100 +14,96 @@
 
 # BuildFlow
 
-**Code for “BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Imagery as Deterministic Continuous Evolution”**
+> **Notice:** This paper has been accepted for publication in *IEEE Transactions on Geoscience and Remote Sensing* on 26 October 2026.
 
-This repository contains the official PyTorch implementation of BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Imagery as Deterministic Continuous Evolution.
+**Code for "BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Images as Deterministic Continuous Evolution"**
+
+This repository contains the official PyTorch implementation of BuildFlow: Rethinking Building Extraction from High-Resolution Remote Sensing Images as Deterministic Continuous Evolution.
 
 ## Setup
-
-First, download and set up the repository:
 
 ```bash
 git clone https://github.com/qwerasdzxhjk/BuildFlow
 cd BuildFlow
-```
-
-Create and activate a Conda environment:
-
-```bash
 conda create -n buildflow python=3.10 -y
 conda activate buildflow
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 ```
 
-Install the required dependencies using `uv` for faster installation:
-
-```bash
-pip install uv
-uv pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
-uv pip install -r requirements.txt
-```
+By default the scripts use CUDA device `0`. Set `BUILD_FLOW_CUDA_VISIBLE_DEVICES` to select another GPU.
 
 ## Datasets
 
-Please download the required datasets from their official sources:
-
 * **WHU Building Dataset**: [Download here](https://gpcv.whu.edu.cn/data/building_dataset.html)
 * **WHU-Mix Dataset**: [Download here](https://gpcv.whu.edu.cn/data/whu-mix(raster)/whu_mix%20(raster).html)
+* **VHIR Dataset**: A UAV dataset described in the paper; please contact the authors to obtain it.
 
-After downloading, please ensure the datasets are placed in your designated data directory and update the corresponding paths in the `configs/` files.
+All datasets are tiled into `512x512` images and binary masks with matching filenames. Fill in the dataset paths in `configs/WHU.py`, `configs/WHU_Mix.py`, and `configs/VHIR.py`.
 
 ## Pre-trained Models
 
-Before training or testing, you need to download the necessary foundation models and pre-trained weights.
+Before training or testing, download the required foundation models:
 
-**Foundation Models:**
 * **VAE**: Download `assets.tar` from [here](https://huggingface.co/QHL067/CrossFlow/blob/main/assets.tar) and extract it to the appropriate directory.
-* **CrossFlow**: Download the pre-trained weights `t2i_512px_t5_dit.pth` from [here](https://huggingface.co/QHL067/CrossFlow/blob/main/pretrained_models/t2i_512px_t5_dit.pth).
+* **CrossFlow**: Download `t2i_512px_t5_dit.pth` from [here](https://huggingface.co/QHL067/CrossFlow/blob/main/pretrained_models/t2i_512px_t5_dit.pth).
 
-**BuildFlow Weights (Ours):**
-* **BuildFlow on WHU**: [Coming soon]()
-* **BuildFlow on WHU-Mix**: [Coming soon]()
+**BuildFlow weights are not publicly available.** Please contact the authors for access inquiries.
 
 ## Data Preparation
 
-To accelerate the training process, it is highly recommended to pre-process the dataset images using the VAE. This step extracts and caches the latent features:
+Pre-encode the image/mask pairs into VAE latents to accelerate training. Edit the paths in `extract_features.py` (`vae_path`, `source_root`, `target_root`, `save_dir`) and run:
 
 ```bash
 python extract_features.py
 ```
 
+Then set `train_latent_root` and `val_latent_root` in the corresponding config file.
+
 ## Training
 
-Once the features are extracted, you can start training the BuildFlow model. We provide configuration files for different datasets (e.g., WHU Building Dataset). 
-
-To train the model using the WHU dataset configuration, run:
+Fill in the dataset paths in the config file, then run:
 
 ```bash
 python train.py --config=configs/WHU.py
 ```
 
+Use `configs/WHU_Mix.py` or `configs/VHIR.py` for the other datasets.
+
 ## Testing
-
-We provide testing scripts for both the overall building extraction performance and the specific VAE encoding/decoding capabilities mentioned in the paper.
-
-**1. Evaluate BuildFlow**
-To test the trained model for building extraction on the target dataset:
 
 ```bash
 python test.py --config=configs/WHU.py
 ```
 
-## Evaluate VAE Performance
+The script reports IoU, F1, B-F1, B-SSIM, and B-IoU, and saves the predicted masks to `pred_mask_dir`.
 
-To specifically test the VAE encoding and decoding capabilities as described in the paper, run the script without the config argument:
+## Polygon Geometry Evaluation
 
-```bash
-python test.py
-```
-
-## Trajectory & Interpolation Analysis
-To intuitively understand the deterministic trajectory evolution and manifold deviations mentioned in the introduction of our paper, we provide a dedicated analysis script. This script compares Pixel Linear and Latent Linear (VAE) interpolations, extracts Shannon entropy and structural clarity metrics, and saves intermediate visual frames along with a CSV report and trend charts.
+Evaluate the saved masks with polygon-level geometry metrics:
 
 ```bash
-python analyze_intro.py --config=configs/WHU.py --target_image=image_001
+python evaluate_geometry.py --pred_dir=/path/to/pred_masks --gt_dir=/path/to/test/masks \
+    --output_csv=geometry_metrics.csv
 ```
 
-> **⚠️ Important Note:** The `--target_image` parameter should **only contain the filename without the file extension** (e.g., use `image_001`, NOT `image_001.tif` or `image_001.png`).
+This reports C-IoU, Vertex P/R/F1@3px, PoLiS, Boundary F@2px, and image IoU. Predictions and ground truth are polygonized with 8-connected components, a minimum area of 16 px^2, and Douglas-Peucker simplification with epsilon = 2.0 px.
+
+## VAE Evaluation
+
+```bash
+python test_vae.py --vae_path=/path/to/autoencoder_kl.pth --mask_dir=/path/to/masks
+```
+
+## Trajectory Analysis
+
+```bash
+python analyze.py --config=configs/WHU.py \
+  --input_dir=/path/to/test/images --label_dir=/path/to/test/masks \
+  --output_dir=/path/to/output --target_image=image_001
+```
+
+`--target_image` is optional and should contain the filename without extension. If omitted, all images in `input_dir` are processed.
 
 ## Acknowledgement
 

@@ -1,13 +1,20 @@
+"""BuildFlow velocity field network: a CrossFlow-style DiT adapted for
+image-to-image (latent-to-latent) flow matching.
+
+The network input is the channel-wise concatenation of the current latent
+state z_t and the source latent z_img (source feature injection); the
+conditioning is the timestep embedding plus the frozen null-indicator
+embedding inherited from CrossFlow.
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
-import open_clip
 import torch.utils.checkpoint
 
-from .trans_autoencoder import TransEncoder, Adaptor
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -219,13 +226,6 @@ class DiT_for_I2I(nn.Module):
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         
-        # NOTE: source_embedder is initialized but will NOT be used in the forward pass for this debug version.
-        # source_latent_dim = self.in_channels * self.input_size * self.input_size
-        # self.source_embedder = nn.Sequential(
-        #     nn.Linear(source_latent_dim, hidden_size),
-        #     nn.SiLU(),
-        #     nn.Linear(hidden_size, hidden_size),
-        # )
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -268,7 +268,8 @@ class DiT_for_I2I(nn.Module):
         if null_indicator is not None:
             c = c + self.y_embedder(null_indicator)
         
-        # --- SOURCE_LATENT CONDITIONING IS DISABLED FOR THIS VERSION ---
+        # Source conditioning is provided through the concatenated latent
+        # channels above; no separate cross-attention branch is required.
         
         for block in self.blocks:
             x = block(x, c)
@@ -307,7 +308,7 @@ class DiT_I2I(nn.Module):
         return self.flow_model(
             x=target_latent,
             t=t,
-            source_latent=source_latent, # Passed but ignored by DiT_for_I2I
+            source_latent=source_latent,
             null_indicator=null_indicator
         )
 

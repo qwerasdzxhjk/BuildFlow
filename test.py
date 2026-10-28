@@ -1,22 +1,29 @@
+"""BuildFlow inference and evaluation on a test/validation split.
+
+Loads the frozen CrossFlow base model plus the trained LoRA adapter and
+x_embedder, runs the deterministic Euler ODE integration from the encoded
+input image to the predicted mask, and reports dense pixel- and boundary-level
+metrics (IoU, F1, B-F1, B-SSIM, B-IoU). Predicted masks can be saved for the
+polygon-level geometry evaluation (evaluate_geometry.py).
+"""
+
 import os
-# Set CUDA device before any PyTorch imports
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
-import sys
+
+os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get(
+    'BUILD_FLOW_CUDA_VISIBLE_DEVICES',
+    os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
+)
 from pathlib import Path
 import ml_collections
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 from PIL import Image
 import numpy as np
-import cv2
-from skimage.metrics import structural_similarity as ssim
 from absl import app, flags
 from absl import logging as absl_logging
 from ml_collections import config_flags
 from tqdm.auto import tqdm
 import einops
-from peft import PeftModel
 import collections
 
 # Assume utils, libs, and diffusion modules are in the Python search path
@@ -24,124 +31,18 @@ import utils
 import libs.autoencoder
 from diffusion.flow_matching import ODEEulerFlowMatchingSolver
 
+from metrics import (
+    boundary_iou,
+    calculate_bf1_matlab,
+    calculate_bssim_strict,
+    calculate_f1_score,
+    calculate_iou,
+)
+
 # --- Command Line Flags ---
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "Configuration file.", lock_config=True)
 flags.mark_flags_as_required(["config"])
-
-# ==================== Metric Calculation Functions ====================
-
-def to_binary_numpy(tensor, threshold=0.5):
-    if isinstance(tensor, torch.Tensor):
-        tensor = tensor.cpu().detach().numpy()
-    if tensor.max() > 1:
-        return (tensor > 127).astype(np.uint8)
-    else:
-        return (tensor > threshold).astype(np.uint8)
-
-def to_binary_tensor(tensor, threshold=0.5):
-    if isinstance(tensor, np.ndarray):
-        tensor = torch.from_numpy(tensor)
-    if tensor.max() > 1:
-        return (tensor > 127).float()
-    else:
-        return (tensor > threshold).float()
-
-def mask_to_boundary_erode(mask, dilation_ratio=0.01):
-    h, w = mask.shape
-    img_diag = np.sqrt(h ** 2 + w ** 2)
-    dilation = int(round(dilation_ratio * img_diag))
-    if dilation < 1:
-        dilation = 1
-    new_mask = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    new_mask_erode = cv2.erode(new_mask, kernel, iterations=dilation)
-    mask_erode = new_mask_erode[1: h + 1, 1: w + 1]
-    return mask - mask_erode
-
-def boundary_iou(gt, dt, dilation_ratio=0.003):
-    gt = to_binary_numpy(gt)
-    dt = to_binary_numpy(dt)
-    
-    gt_boundary = mask_to_boundary_erode(gt, dilation_ratio)
-    dt_boundary = mask_to_boundary_erode(dt, dilation_ratio)
-    
-    intersection = ((gt_boundary * dt_boundary) > 0).sum()
-    union = ((gt_boundary + dt_boundary) > 0).sum()
-    
-    if union == 0:
-        return 1.0
-    return intersection / union
-
-def get_boundary_strict(mask_uint8):
-    pad_mask = cv2.copyMakeBorder(mask_uint8, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    eroded_pad = cv2.erode(pad_mask, kernel)
-    eroded = eroded_pad[1:-1, 1:-1]
-    boundary = mask_uint8 - eroded
-    return boundary
-
-def calculate_bf1_matlab(pred_bin, gt_bin, distance_threshold=2.0):
-    pred_bin = to_binary_numpy(pred_bin)
-    gt_bin = to_binary_numpy(gt_bin)
-
-    pred_boundary = get_boundary_strict(pred_bin)
-    gt_boundary = get_boundary_strict(gt_bin)
-
-    pred_b_sum = np.sum(pred_boundary)
-    gt_b_sum = np.sum(gt_boundary)
-
-    if gt_b_sum == 0 and pred_b_sum == 0:
-        return 1.0
-    if gt_b_sum == 0 or pred_b_sum == 0:
-        return 0.0
-
-    gt_dist_map = cv2.distanceTransform(1 - gt_boundary, cv2.DIST_L2, 5)
-    pred_dists = gt_dist_map[pred_boundary > 0]
-    precision = np.sum(pred_dists <= distance_threshold) / (pred_b_sum + 1e-6)
-
-    pred_dist_map = cv2.distanceTransform(1 - pred_boundary, cv2.DIST_L2, 5)
-    gt_dists = pred_dist_map[gt_boundary > 0]
-    recall = np.sum(gt_dists <= distance_threshold) / (gt_b_sum + 1e-6)
-
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-    return f1
-
-def calculate_bssim_strict(pred_bin, gt_bin):
-    pred_bin = to_binary_numpy(pred_bin).astype(np.float32)
-    gt_bin_f = to_binary_numpy(gt_bin).astype(np.float32)
-    gt_boundary = get_boundary_strict(to_binary_numpy(gt_bin)).astype(np.float32)
-
-    if np.sum(gt_boundary) == 0:
-        return np.nan
-
-    H, W = pred_bin.shape
-    win_size = min(H, W, 11)
-    if win_size % 2 == 0:
-        win_size -= 1
-    if win_size < 3:
-        return np.nan
-
-    _, ssim_map = ssim(gt_bin_f, pred_bin, win_size=win_size, data_range=1.0, full=True)
-    return (ssim_map * gt_boundary).sum() / (gt_boundary.sum() + 1e-6)
-
-def calculate_iou(pred, label, eps=1e-6):
-    pred = to_binary_tensor(pred)
-    label = to_binary_tensor(label)
-    intersection = (pred * label).sum()
-    union = pred.sum() + label.sum() - intersection
-    if union == 0:
-        return 1.0
-    return (intersection / (union + eps)).item()
-
-def calculate_f1_score(pred, label):
-    pred = to_binary_tensor(pred)
-    label = to_binary_tensor(label)
-    tp = (pred * label).sum()
-    denominator = pred.sum() + label.sum()
-    if denominator == 0:
-        return 1.0
-    return (2 * tp / (denominator + 1e-6)).item()
 
 # ==================== Dataset & Pipeline ====================
 
@@ -251,7 +152,12 @@ def sample(config: ml_collections.ConfigDict):
     if test_config.base_model_path and os.path.exists(test_config.base_model_path):
         absl_logging.info(f"Attempting to load and remap pre-trained weights from: {test_config.base_model_path}")
         try:
-            pre_weights = torch.load(test_config.base_model_path, map_location='cpu')
+            try:
+                pre_weights = torch.load(
+                    test_config.base_model_path, map_location='cpu', weights_only=False
+                )
+            except TypeError:  # older torch without the weights_only kwarg
+                pre_weights = torch.load(test_config.base_model_path, map_location='cpu')
             if 'state_dict' in pre_weights: pre_weights = pre_weights['state_dict']
             elif 'model' in pre_weights: pre_weights = pre_weights['model']
             elif 'nnet' in pre_weights: pre_weights = pre_weights['nnet']
@@ -259,7 +165,19 @@ def sample(config: ml_collections.ConfigDict):
             new_state_dict = collections.OrderedDict()
             shared_prefixes = ['x_embedder.', 't_embedder.', 'y_embedder.', 'blocks.', 'final_layer.']
             transferred_count = 0
+            pretrained_x_weight = None
+            pretrained_x_bias = None
             for key, value in pre_weights.items():
+                # The PEFT wrapper stores x_embedder under
+                # ``modules_to_save.default`` and the I2I model has twice the
+                # input channels.  Handle it explicitly below rather than
+                # silently ignoring it under strict=False.
+                if key == 'x_embedder.proj.weight':
+                    pretrained_x_weight = value
+                    continue
+                if key == 'x_embedder.proj.bias':
+                    pretrained_x_bias = value
+                    continue
                 is_shared = False
                 if key == 'pos_embed':
                     is_shared = True
@@ -276,6 +194,26 @@ def sample(config: ml_collections.ConfigDict):
             absl_logging.info(f"Remapped and filtered weights. Transferred {transferred_count} tensors.")
             target_model = base_nnet_ema.base_model.model
             missing_keys, unexpected_keys = target_model.load_state_dict(new_state_dict, strict=False)
+            if pretrained_x_weight is not None:
+                embedder = base_nnet_ema.flow_model.x_embedder.modules_to_save['default']
+                weight = embedder.proj.weight.data.clone()
+                original_channels = pretrained_x_weight.shape[1]
+                if original_channels > weight.shape[1]:
+                    raise ValueError(
+                        f"Pretrained x_embedder has {original_channels} input channels, "
+                        f"but the I2I model accepts {weight.shape[1]}."
+                    )
+                weight[:, :original_channels].copy_(pretrained_x_weight)
+                for channel in range(original_channels, weight.shape[1]):
+                    weight[:, channel].copy_(pretrained_x_weight[:, channel % original_channels])
+                embedder.proj.weight.data.copy_(weight)
+                if pretrained_x_bias is not None:
+                    embedder.proj.bias.data.copy_(pretrained_x_bias)
+            if missing_keys or unexpected_keys:
+                absl_logging.warning(
+                    "Base checkpoint key differences (missing=%s, unexpected=%s)",
+                    missing_keys[:8], unexpected_keys[:8],
+                )
             absl_logging.info("Pre-trained base model weights loaded successfully.")
         except Exception as e:
             absl_logging.error(f"Failed to load and remap pre-trained weights: {e}", exc_info=True)
@@ -290,9 +228,15 @@ def sample(config: ml_collections.ConfigDict):
     training_state_path = os.path.join(test_config.ckpt_dir, 'training_state.pt')
     if not os.path.exists(training_state_path):
         raise FileNotFoundError(f"Required 'training_state.pt' not found: {test_config.ckpt_dir}")
-    state = torch.load(training_state_path, map_location=device)
-    if 'x_embedder' in state:
-        base_nnet_ema.flow_model.x_embedder.modules_to_save['default'].load_state_dict(state['x_embedder'])
+    try:
+        state = torch.load(training_state_path, map_location=device, weights_only=False)
+    except TypeError:  # older torch without the weights_only kwarg
+        state = torch.load(training_state_path, map_location=device)
+    # The EMA network must use the EMA copy saved alongside the EMA LoRA
+    # adapter.  Fall back to the main weights for backwards compatibility.
+    embedder_state = state.get('x_embedder_ema', state.get('x_embedder'))
+    if embedder_state is not None:
+        base_nnet_ema.flow_model.x_embedder.modules_to_save['default'].load_state_dict(embedder_state)
     else:
         raise ValueError("'x_embedder' weights not found in training_state.pt.")
 

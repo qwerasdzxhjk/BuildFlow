@@ -1,22 +1,26 @@
-"""
-This file is used to extract features for I2I (Image-to-Image) training data.
-It extracts latent representations for source-target image pairs using VAE encoder.
-For training efficiency, precomputed latents are saved to avoid repeated encoding.
+"""Pre-encode image/mask pairs into VAE latents for faster training.
+
+Edit the paths in main(), then run:
+
+    python extract_features.py
+
+Every matched image/mask pair (same filename stem, .tif) produces one .npz
+archive holding the source and target latents consumed by the training
+config's train_latent_root / val_latent_root.
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get(
+    'BUILD_FLOW_CUDA_VISIBLE_DEVICES',
+    os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
+)
 import shutil
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
-import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 import einops
-import json
 import libs.autoencoder
 from glob import glob
 
@@ -26,24 +30,6 @@ def recreate_folder(folder_path):
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path)
     os.makedirs(folder_path)
-
-
-def center_crop_arr(pil_image, image_size):
-    """Center crop image to specified size."""
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
 
 
 def extract_i2i_features_from_folders(source_root, target_root, save_dir,
@@ -90,16 +76,12 @@ def extract_i2i_features_from_folders(source_root, target_root, save_dir,
 
                 # --- TARGET IMAGE PROCESSING (matches ImagePairDataset) ---
                 # --- MODIFICATION 3: Replicated the exact target processing logic ---
-                target_pil = Image.open(target_files[filename]).convert("L") # Load as grayscale
-                # --- MODIFICATION 2: Removed center_crop_arr for target ---
+                target_pil = Image.open(target_files[filename]).convert("L")
                 target_img_arr = np.array(target_pil)
-                
-                # Replicating the logic: target_image_arr = target_image_pil * 255
-                # Assuming the input .tif is float [0,1], otherwise this is problematic.
-                # If input is uint8 [0,255], this will cause overflow.
-                # Strictly following the provided logic.
 
-                target_img_arr = target_img_arr * 255
+                # Normalize masks to a stable binary 0/255 representation.
+                # This handles both 0/1 and 0/255 source masks without uint8 overflow.
+                target_img_arr = (target_img_arr > 0).astype(np.uint8) * 255
 
                 target_img = np.stack([target_img_arr] * 3, axis=-1) # Stack to 3 channels
                 
@@ -124,8 +106,17 @@ def extract_i2i_features_from_folders(source_root, target_root, save_dir,
             # The VAE encoding part remains the same
             # Note: `resolution` parameter is no longer used for cropping but might be
             # needed by the VAE if it has different behaviors. The code here is generic.
-            source_latent = autoencoder(batch_source_tensor, fn='encode_moments').squeeze(0)
-            target_latent = autoencoder(batch_target_tensor, fn='encode_moments').squeeze(0)
+            # Keep the leading batch dimension.  Calling squeeze(0) here
+            # corrupts a final batch of size one by turning ``[1, C, H, W]``
+            # into ``[C, H, W]`` and making the loop below iterate channels.
+            source_latent = autoencoder(batch_source_tensor, fn='encode_moments')
+            target_latent = autoencoder(batch_target_tensor, fn='encode_moments')
+
+        if source_latent.shape[0] != len(batch_names):
+            raise RuntimeError(
+                f"VAE returned {source_latent.shape[0]} samples for "
+                f"{len(batch_names)} input files."
+            )
 
         # Save features
         for j, (name, source_lat, target_lat) in enumerate(zip(batch_names, source_latent, target_latent)):

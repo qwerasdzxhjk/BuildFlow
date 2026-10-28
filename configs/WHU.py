@@ -1,137 +1,147 @@
-import ml_collections
+"""BuildFlow configuration for the WHU Building Dataset.
+
+Fill in every path marked with TODO, then run:
+
+    python train.py --config=configs/WHU.py [--workdir=/path/to/output]
+"""
+
 import os
 from dataclasses import dataclass
 
+import ml_collections
+
+
 @dataclass
 class Args:
-    """A simple dataclass-like helper to store nested configurations."""
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-# =============================================================================
-# == DiT Model Arguments (Defined globally, similar to the reference) ==
-# =============================================================================
-# NOTE: Customize these arguments to match exactly what your I2I DiT model needs.
-# The values here are tailored for I2I, removing text-specific ones like 'clip_dim'.
-model = Args(
-    # Core DiT architecture arguments
-    latent_size = 64,
-    channels = 4,
-)
+
+# Velocity network input: 512x512 images are encoded by the frozen VAE into
+# 64x64x4 latents.
+model = Args(latent_size=64, channels=4)
 
 
 def d(**kwargs):
-    """Helper function to create a ConfigDict."""
     return ml_collections.ConfigDict(initial_dictionary=kwargs)
 
 
 def get_config():
-    """Get the hyperparameter configuration for I2I Flow Matching training."""
     config = ml_collections.ConfigDict()
 
+    # ------------------------------------------------------------------
+    # Seed and data pipeline
+    # ------------------------------------------------------------------
+    # The paper reports mean +/- std over three independent seeds; override
+    # on the command line, e.g. --config.seed=42.
     config.seed = 1234
+    # Train from the pre-encoded VAE latents produced by extract_features.py.
     config.use_preprocessed = True
 
-    # --- Path Settings ---
-    # TODO: Fill in your local work directory before training.
-    config.workdir = ""
+    # ------------------------------------------------------------------
+    # Output paths (TODO: fill in before running)
+    # ------------------------------------------------------------------
+    config.workdir = ''
     config.ckpt_root = os.path.join(config.workdir, 'checkpoints')
     config.sample_dir = os.path.join(config.workdir, 'samples')
-    
-    # --- Component Configurations ---
+
+    # ------------------------------------------------------------------
+    # Frozen VAE (CrossFlow assets): encodes 512x512 images/masks into
+    # 64x64x4 latents and decodes the final ODE state back to pixels.
+    # ------------------------------------------------------------------
     config.autoencoder = d(
-        # TODO: Fill in your local VAE checkpoint path.
-        pretrained_path="",
-        scale_factor=0.23010
+        pretrained_path='',     # TODO: path to autoencoder_kl.pth
+        scale_factor=0.23010,
     )
 
-    # --- Use the globally defined model arguments ---
-    global model
-    config.nnet = d(
-        name='DiT-I2I-H/2', # The key for your model in DiT_I2I_models dict
-        model_args=model,   # Assigning the global 'model' object here
-    )
+    # ------------------------------------------------------------------
+    # Velocity field network: DiT-H/2 fine-tuned with LoRA
+    # ------------------------------------------------------------------
+    config.nnet = d(name='DiT-I2I-H/2', model_args=model)
 
+    # ------------------------------------------------------------------
+    # Dataset directories (TODO: fill in before running)
+    # All image/mask tiles are 512x512 .tif files, paired by filename stem.
+    # ------------------------------------------------------------------
     config.dataset = d(
+        name='WHU',
         image_size=512,
-        # TODO: Fill in your local training image directory.
-        train_source_root='',
-        # TODO: Fill in your local training mask directory.
-        train_target_root='',
-        # TODO: Fill in your local validation image directory.
-        val_source_root='',
-        # TODO: Fill in your local validation mask directory.
-        val_target_root='',
-        # TODO: Fill in your local preprocessed training latent directory.
-        train_latent_root='',
-        # TODO: Fill in your local preprocessed validation latent directory.
-        val_latent_root='',
-        # TODO: Fill in your local test image directory.
-        test_source_root='',
-        # TODO: Fill in your local test mask directory.
-        test_target_root='',
+        train_source_root='',   # TODO
+        train_target_root='',   # TODO
+        val_source_root='',     # TODO (used for best-checkpoint selection)
+        val_target_root='',     # TODO
+        test_source_root='',    # TODO (official test split, see config.test)
+        test_target_root='',    # TODO
+        train_latent_root='',   # TODO (output of extract_features.py)
+        val_latent_root='',     # TODO (output of extract_features.py)
     )
-    
-    # --- Training Loop & Hyperparameters ---
+
+    # ------------------------------------------------------------------
+    # Training schedule (paper Section IV-A3)
+    # ------------------------------------------------------------------
     config.train = d(
         n_steps=200000,
         batch_size=4,
-        num_workers=8,
         log_interval=1000,
         save_interval=10000,
         ema_rate=0.9999,
-        max_checkpoints_to_keep=10,
-        # TODO: Fill in your local pretrained DiT checkpoint path.
-        pretrained_ckpt_path="",
-        start_eval_step = 90000,
-        dvi_init_strategy = 'copy',
-        # 'zero': initialize new channels with zeros (default)
-        # 'random': initialize new channels with Kaiming Normal
-        # 'copy': copy original pretrained channel weights into new channels
+        start_eval_step=90000,
+        pretrained_ckpt_path='',    # TODO: CrossFlow t2i_512px_t5_dit.pth
+        # Initialization of the extra source-injection input channels.
+        dvi_init_strategy='copy',
+        # Anchor sampling: probability of forcing the source anchor t=0.
+        anchor_prob=0.5,
+        # Perturbation noise strength for non-anchor states (t > 0).
+        sigma_noise=2.0,
     )
 
+    # ------------------------------------------------------------------
+    # LoRA fine-tuning: applied to qkv and attn.proj; the x_embedder is
+    # fully trained to accept the injected source latent (8 input channels).
+    # ------------------------------------------------------------------
     config.lora = d(
         r=64,
         lora_alpha=128,
         lora_dropout=0.1,
-        target_modules=["qkv", "attn.proj"] # Adjust according to your model definition
+        target_modules=['qkv', 'attn.proj'],
     )
 
+    # ------------------------------------------------------------------
+    # Optimizer and learning-rate warmup
+    # ------------------------------------------------------------------
     config.optimizer = d(
-        name='adamw',
-        lr=1e-4,
-        weight_decay=0.001,
-        betas=(0.9, 0.999)
+        name='adamw', lr=1e-4, weight_decay=0.001, betas=(0.9, 0.999)
     )
+    config.lr_scheduler = d(name='customized', warmup_steps=5000)
 
-    config.lr_scheduler = d(
-        name='customized',
-        warmup_steps=5000
-    )
-
-    # --- Sampling / Evaluation ---
+    # ------------------------------------------------------------------
+    # Inference: Euler ODE solver with classifier-free guidance
+    # ------------------------------------------------------------------
     config.sample = d(
         sample_steps=10,
-        n_samples=16,
         scale=2.0,
-        mini_batch_size=4
     )
 
+    # ------------------------------------------------------------------
+    # Validation used during training for best-checkpoint selection.
+    # For the official test split, point input_dir/label_dir at
+    # dataset.test_source_root / dataset.test_target_root and rerun test.py.
+    # ------------------------------------------------------------------
     config.test = d(
         ckpt_dir=os.path.join(config.ckpt_root, 'best_model'),
-        input_dir=config.dataset.test_source_root,
+        input_dir=config.dataset.val_source_root,
         output_dir=os.path.join(config.workdir, 'test'),
-        label_dir=config.dataset.test_target_root,
+        label_dir=config.dataset.val_target_root,
         base_model_path=config.train.pretrained_ckpt_path,
         threshold=0.5,
         n_samples=-1,
-        sample_steps=config.sample.sample_steps,
+        sample_steps=10,
         sample_steps_list=None,
-        cfg_scale=config.sample.scale,
+        cfg_scale=2.0,
         batch_size=4,
         num_workers=4,
         save_pred_masks=True,
-        pred_mask_dir=os.path.join(config.workdir, 'test', 'pred_masks')
+        pred_mask_dir=os.path.join(config.workdir, 'test', 'pred_masks'),
     )
     return config

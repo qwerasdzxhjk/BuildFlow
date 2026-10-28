@@ -1,24 +1,32 @@
+"""Training entry point for BuildFlow.
+
+Fine-tunes the frozen CrossFlow DiT with LoRA to learn the velocity field of
+the deterministic image-to-mask flow in VAE latent space:
+
+    python train.py --config=configs/WHU.py [--workdir=/path/to/output]
+"""
+
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get(
+    'BUILD_FLOW_CUDA_VISIBLE_DEVICES',
+    os.environ.get('CUDA_VISIBLE_DEVICES', '0'),
+)
 import sys
 from pathlib import Path
-import tempfile
 import collections
+import random
 import numpy as np
 import shutil
 
 import ml_collections
 import torch
-from torch import multiprocessing as mp
 from torch.cuda.amp import GradScaler
-from torchvision.utils import make_grid, save_image
 from absl import app, flags
 from absl import logging as absl_logging
 from ml_collections import config_flags
 from tqdm.auto import tqdm
-import builtins
 import glob
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft.utils.save_and_load import set_peft_model_state_dict
 
 import utils
 import libs.autoencoder
@@ -31,13 +39,135 @@ config_flags.DEFINE_config_file("config", None, "Training configuration.", lock_
 flags.mark_flags_as_required(["config"])
 flags.DEFINE_string("workdir", None, "Work unit directory.")
 
+
+def _load_peft_adapter(model, adapter_path, device, label):
+    if not os.path.exists(adapter_path):
+        raise FileNotFoundError(f"Missing {label} adapter checkpoint: {adapter_path}")
+    adapter_weights = _load_torch_state(adapter_path, device)
+    incompatible = set_peft_model_state_dict(model, adapter_weights, adapter_name='default')
+    unexpected = list(getattr(incompatible, 'unexpected_keys', ()))
+    if unexpected:
+        raise RuntimeError(
+            f"{label} adapter has unexpected keys after PEFT remapping: {unexpected[:8]}"
+        )
+    absl_logging.info(f"Restored {len(adapter_weights)} tensors from {label}: {adapter_path}")
+
+
+def _capture_rng_state():
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(rng_state):
+    if not rng_state:
+        return
+    random.setstate(rng_state['python'])
+    np.random.set_state(rng_state['numpy'])
+    # training_state.pt may be loaded with map_location=device, but RNG APIs
+    # require CPU byte tensors even when the model itself lives on CUDA.
+    torch_state = torch.as_tensor(rng_state['torch'], dtype=torch.uint8, device='cpu')
+    torch.set_rng_state(torch_state)
+    if torch.cuda.is_available() and rng_state.get('cuda') is not None:
+        cuda_states = [
+            torch.as_tensor(state, dtype=torch.uint8, device='cpu')
+            for state in rng_state['cuda']
+        ]
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _load_torch_state(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _build_training_state(train_state, scaler, best_iou, config):
+    return {
+        'step': train_state.step,
+        'optimizer': train_state.optimizer.state_dict(),
+        'lr_scheduler': train_state.lr_scheduler.state_dict(),
+        'scaler': scaler.state_dict(),
+        'best_iou': float(best_iou),
+        'rng_state': _capture_rng_state(),
+        'x_embedder': train_state.nnet.flow_model.x_embedder.modules_to_save['default'].state_dict(),
+        'x_embedder_ema': train_state.nnet_ema.flow_model.x_embedder.modules_to_save['default'].state_dict(),
+        'seed': int(config.seed),
+        'dataset_name': str(config.dataset.name),
+    }
+
+
+def _load_pretrained_base(train_state, config):
+    pretrained_ckpt_path = config.train.get('pretrained_ckpt_path')
+    if not pretrained_ckpt_path or not os.path.exists(pretrained_ckpt_path):
+        raise FileNotFoundError(f"Pre-trained checkpoint not found: {pretrained_ckpt_path}")
+
+    absl_logging.info(f"Loading frozen pre-trained base weights from: {pretrained_ckpt_path}")
+    pre_weights = _load_torch_state(pretrained_ckpt_path, 'cpu')
+    if 'state_dict' in pre_weights:
+        pre_weights = pre_weights['state_dict']
+    elif 'model' in pre_weights:
+        pre_weights = pre_weights['model']
+    elif 'nnet' in pre_weights:
+        pre_weights = pre_weights['nnet']
+
+    shared_state = collections.OrderedDict()
+    shared_prefixes = ['x_embedder.', 't_embedder.', 'y_embedder.', 'blocks.', 'final_layer.']
+    original_x_embedder_weight = None
+    original_x_embedder_bias = None
+
+    for key, value in pre_weights.items():
+        if key == 'x_embedder.proj.weight':
+            original_x_embedder_weight = value
+            continue
+        if key == 'x_embedder.proj.bias':
+            original_x_embedder_bias = value
+            continue
+        if key == 'pos_embed' or any(key.startswith(prefix) for prefix in shared_prefixes):
+            shared_state[f'flow_model.{key}'] = value
+
+    if original_x_embedder_weight is None:
+        raise KeyError("Pre-trained checkpoint does not contain x_embedder.proj.weight")
+
+    current_embedder = train_state.nnet.flow_model.x_embedder.modules_to_save['default']
+    new_weight = current_embedder.proj.weight.data.clone()
+    in_channels_orig = original_x_embedder_weight.shape[1]
+    new_weight[:, :in_channels_orig, :, :] = original_x_embedder_weight
+
+    init_strategy = config.train.get('dvi_init_strategy', 'zero')
+    if init_strategy == 'random':
+        torch.nn.init.kaiming_normal_(new_weight[:, in_channels_orig:, :, :])
+    elif init_strategy == 'copy':
+        for channel in range(in_channels_orig, new_weight.shape[1]):
+            new_weight[:, channel, :, :] = original_x_embedder_weight[:, channel % in_channels_orig, :, :]
+    else:
+        new_weight[:, in_channels_orig:, :, :].zero_()
+
+    shared_state['flow_model.x_embedder.modules_to_save.default.proj.weight'] = new_weight
+    if original_x_embedder_bias is not None:
+        shared_state['flow_model.x_embedder.modules_to_save.default.proj.bias'] = original_x_embedder_bias
+
+    train_state.nnet.base_model.model.load_state_dict(shared_state, strict=False)
+    train_state.nnet_ema.base_model.model.load_state_dict(shared_state, strict=False)
+    absl_logging.info(
+        f"Loaded {len(shared_state)} frozen base tensors into both main and EMA models."
+    )
+
 def train(config: ml_collections.ConfigDict):
     if config.get('benchmark', False):
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    random.seed(config.seed)
+    np.random.seed(config.seed)
     torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
 
     config.mixed_precision = 'fp16' if torch.cuda.is_available() else 'no'
     config = ml_collections.FrozenConfigDict(config)
@@ -53,118 +183,66 @@ def train(config: ml_collections.ConfigDict):
     absl_logging.info("Data loaders created.")
 
     train_state = utils.initialize_train_state(config, device, layers_to_fully_train=['flow_model.x_embedder'])
+    _load_pretrained_base(train_state, config)
     
-    ckpt_dirs = sorted(glob.glob(os.path.join(config.ckpt_root, '[0-9]'*7)))
-    if len(ckpt_dirs) > 0:
-        latest_ckpt_dir = ckpt_dirs[-1]
+    resume_state = None
+    did_resume = False
+    resume_best_iou = float(config.train.get('resume_best_iou', 0.0))
+    latest_ckpt_dir = os.path.join(config.ckpt_root, 'latest')
+    legacy_ckpt_dirs = sorted(glob.glob(os.path.join(config.ckpt_root, '[0-9]'*7)))
+    if os.path.exists(os.path.join(latest_ckpt_dir, 'training_state.pt')):
+        pass
+    elif len(legacy_ckpt_dirs) > 0:
+        latest_ckpt_dir = legacy_ckpt_dirs[-1]
+    else:
+        latest_ckpt_dir = None
+
+    if latest_ckpt_dir is not None:
         absl_logging.info(f"Found latest checkpoint: {latest_ckpt_dir}")
         state_path = os.path.join(latest_ckpt_dir, 'training_state.pt')
         if os.path.exists(state_path):
             absl_logging.info(f"Resuming training state from {state_path}")
-            state = torch.load(state_path, map_location=device)
+            state = _load_torch_state(state_path, device)
+            saved_seed = state.get('seed')
+            saved_dataset = state.get('dataset_name')
+            if saved_seed is not None and int(saved_seed) != int(config.seed):
+                raise RuntimeError(
+                    f"Checkpoint seed {saved_seed} does not match requested seed {config.seed}."
+                )
+            if saved_dataset is not None and str(saved_dataset) != str(config.dataset.name):
+                raise RuntimeError(
+                    f"Checkpoint dataset {saved_dataset} does not match requested dataset {config.dataset.name}."
+                )
+            resume_state = state
+            did_resume = True
             train_state.step = state['step']
-            train_state.optimizer.load_state_dict(state['optimizer'])
-            train_state.lr_scheduler.load_state_dict(state['lr_scheduler'])
+
+            lora_main_path = os.path.join(latest_ckpt_dir, 'lora_main', 'adapter_model.bin')
+            lora_ema_path = os.path.join(latest_ckpt_dir, 'lora_ema', 'adapter_model.bin')
+            _load_peft_adapter(train_state.nnet, lora_main_path, device, 'LoRA main')
+            _load_peft_adapter(train_state.nnet_ema, lora_ema_path, device, 'LoRA EMA')
 
             if 'x_embedder' in state:
                 absl_logging.info("Loading fully fine-tuned x_embedder weights from checkpoint.")
                 train_state.nnet.flow_model.x_embedder.modules_to_save['default'].load_state_dict(state['x_embedder'])
             else:
                 absl_logging.warning("Checkpoint does not contain 'x_embedder' weights. It might be an old checkpoint.")
-            
-            lora_main_path = os.path.join(latest_ckpt_dir, 'lora_main', 'adapter_model.bin')
-            lora_ema_path = os.path.join(latest_ckpt_dir, 'lora_ema', 'adapter_model.bin')
-            if os.path.exists(lora_main_path):
-                 absl_logging.info(f"Loading LoRA main adapter from: {lora_main_path}")
-                 main_adapter_weights = torch.load(lora_main_path, map_location=device)
-                 train_state.nnet.load_state_dict(main_adapter_weights, strict=False)
-            if os.path.exists(lora_ema_path):
-                 absl_logging.info(f"Loading LoRA ema adapter from: {lora_ema_path}")
-                 ema_adapter_weights = torch.load(lora_ema_path, map_location=device)
-                 train_state.nnet_ema.load_state_dict(ema_adapter_weights, strict=False)
+            if 'x_embedder_ema' in state:
+                absl_logging.info("Loading EMA x_embedder weights from checkpoint.")
+                train_state.nnet_ema.flow_model.x_embedder.modules_to_save['default'].load_state_dict(state['x_embedder_ema'])
+
+            train_state.optimizer.load_state_dict(state['optimizer'])
+            train_state.lr_scheduler.load_state_dict(state['lr_scheduler'])
+            resume_best_iou = float(state.get('best_iou', resume_best_iou))
+            absl_logging.info(
+                f"Resume state restored at step {train_state.step} with best IoU {resume_best_iou:.4f}."
+            )
         else:
-            absl_logging.warning(f"Checkpoint directory {latest_ckpt_dir} found, but training_state.pt is missing. Starting from scratch.")
+            raise FileNotFoundError(
+                f"Checkpoint directory {latest_ckpt_dir} exists but training_state.pt is missing."
+            )
     else:
         absl_logging.info("No checkpoint found, starting from scratch.")
-
-
-    pretrained_ckpt_path = config.train.get('pretrained_ckpt_path')
-    if pretrained_ckpt_path and train_state.step == 0:
-        absl_logging.info(f"Attempting to load pre-trained weights from: {pretrained_ckpt_path}")
-        if os.path.exists(pretrained_ckpt_path):
-            try:
-                pre_weights = torch.load(pretrained_ckpt_path, map_location='cpu')
-                if 'state_dict' in pre_weights: pre_weights = pre_weights['state_dict']
-                elif 'model' in pre_weights: pre_weights = pre_weights['model']
-                elif 'nnet' in pre_weights: pre_weights = pre_weights['nnet']
-                
-                new_state_dict = collections.OrderedDict()
-                shared_prefixes = ['x_embedder.', 't_embedder.', 'y_embedder.', 'blocks.', 'final_layer.']
-                transferred_count = 0
-                original_x_embedder_weight = None
-                original_x_embedder_bias = None
-
-                for key, value in pre_weights.items():
-                    if key == 'x_embedder.proj.weight':
-                        original_x_embedder_weight = value
-                        continue 
-                    if key == 'x_embedder.proj.bias':
-                        original_x_embedder_bias = value
-                        continue 
-
-                    is_shared = False
-                    if key == 'pos_embed': is_shared = True
-                    else:
-                        for prefix in shared_prefixes:
-                            if key.startswith(prefix):
-                                is_shared = True
-                                break
-                    if is_shared:
-                        new_key = f'flow_model.{key}'
-                        new_state_dict[new_key] = value
-                        transferred_count += 1
-                
-                if original_x_embedder_weight is not None:
-                    absl_logging.info("Found original x_embedder weights. Proceeding with adaptation for DVI.")
-                    current_embedder = train_state.nnet.flow_model.x_embedder.modules_to_save['default']
-                    new_weight = current_embedder.proj.weight.data.clone()
-                    
-                    in_channels_orig = original_x_embedder_weight.shape[1]
-                    new_weight[:, :in_channels_orig, :, :] = original_x_embedder_weight
-                    
-                    init_strategy = config.train.get('dvi_init_strategy', 'zero')
-                    if init_strategy == 'random':
-                        torch.nn.init.kaiming_normal_(new_weight[:, in_channels_orig:, :, :])
-                        absl_logging.info("DVI Ablation: Initialized new channels with Random (Kaiming Normal).")
-                    elif init_strategy == 'copy':
-                        in_total = new_weight.shape[1]
-                        for j in range(in_channels_orig, in_total):
-                            new_weight[:, j, :, :] = original_x_embedder_weight[:, j % in_channels_orig, :, :]
-                        absl_logging.info("DVI Ablation: Initialized new channels by Copying original weights.")
-                    else:
-                        new_weight[:, in_channels_orig:, :, :].zero_()
-                        absl_logging.info("DVI Ablation: Initialized new channels with Zeros.")
-                    
-                    new_state_dict['flow_model.x_embedder.modules_to_save.default.proj.weight'] = new_weight
-                    if original_x_embedder_bias is not None:
-                        new_state_dict['flow_model.x_embedder.modules_to_save.default.proj.bias'] = original_x_embedder_bias
-                    absl_logging.info("Adapted x_embedder weights for Direct Video Injection (DVI).")
-                    transferred_count += 1 
-                
-                absl_logging.info(f"Remapped and filtered weights. Transferred {transferred_count} tensors.")
-                
-                train_state.nnet.base_model.model.load_state_dict(new_state_dict, strict=False)
-                absl_logging.info("Pre-trained weights loaded successfully into the new model structure.")
-                
-                train_state.nnet_ema.load_state_dict(train_state.nnet.state_dict())
-                absl_logging.info("EMA model weights synchronized with the loaded pre-trained weights.")
-            except Exception as e:
-                absl_logging.error(f"Failed to load and remap pre-trained weights: {e}", exc_info=True)
-        else:
-            absl_logging.warning(f"Pre-trained checkpoint not found at: {pretrained_ckpt_path}")
-    elif pretrained_ckpt_path and train_state.step > 0:
-         absl_logging.info(f"Skipping loading pre-trained weights because training is being resumed from step {train_state.step}.")
-
     nnet = train_state.nnet
     nnet_ema = train_state.nnet_ema
     optimizer = train_state.optimizer
@@ -175,10 +253,26 @@ def train(config: ml_collections.ConfigDict):
     autoencoder.to(device)
     autoencoder.eval()
 
-    flow_matcher = ModalityFlowMatching()
-    absl_logging.info("VAE and Flow Matcher initialized.")
+    anchor_prob = config.train.get('anchor_prob', 0.5)
+    sigma_noise = config.train.get('sigma_noise', 2.0)
+    flow_matcher = ModalityFlowMatching(
+        bbs_prob=anchor_prob,
+        sigma_noise=sigma_noise,
+    )
+    absl_logging.info(
+        "VAE and Flow Matcher initialized with anchor_prob=%.3f and sigma_noise=%.3f.",
+        anchor_prob,
+        sigma_noise,
+    )
 
     scaler = GradScaler()
+    if resume_state is not None and 'scaler' in resume_state:
+        scaler.load_state_dict(resume_state['scaler'])
+        absl_logging.info("AMP GradScaler state restored from checkpoint.")
+    if resume_state is not None and 'rng_state' in resume_state:
+        _restore_rng_state(resume_state['rng_state'])
+        absl_logging.info("Python, NumPy, PyTorch and CUDA RNG states restored from checkpoint.")
+    resume_state = None
 
     def encode(_batch):
         with torch.no_grad():
@@ -194,7 +288,6 @@ def train(config: ml_collections.ConfigDict):
                 yield data
 
     data_generator = get_data_generator(train_loader)
-    val_generator = get_data_generator(val_loader)
 
     def train_step(_batch):
         optimizer.zero_grad()
@@ -206,14 +299,11 @@ def train(config: ml_collections.ConfigDict):
             source_latent = encode(_batch['source_images'])
             target_latent = encode(_batch['target_images'])
             
-        with torch.cuda.amp.autocast():
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
             loss, loss_dict = flow_matcher(
                 nnet=nnet,
                 source_latent=source_latent,
                 target_latent=target_latent,
-                target_mask=_batch['target_masks'],
-                autoencoder=autoencoder,
-                all_config=config,
             )
         
         scaler.scale(loss).backward()
@@ -252,55 +342,9 @@ def train(config: ml_collections.ConfigDict):
         )
         return decode(_z)
 
-    def log_sample_images(sample_config):
-        absl_logging.info(f'Generating a sample grid for qualitative evaluation (in serial mode)...')
-        model_for_eval = nnet_ema
-        model_for_eval.eval()
-
-        val_batch = next(val_generator)
-        for k, v in val_batch.items():
-            if isinstance(v, torch.Tensor):
-                val_batch[k] = v.to(device)
-        
-        n_samples = min(sample_config.n_samples, val_batch['source_images'].size(0))
-        
-        source_images_batch = val_batch['source_images'][:n_samples].to(device)
-        target_images_batch = val_batch['target_images'][:n_samples].to(device)
-
-        generated_samples = []
-        
-        absl_logging.info(f"Starting serial sampling for {n_samples} images...")
-        for i in tqdm(range(n_samples), desc="Serial Sampling"):
-            single_source_image = source_images_batch[i].unsqueeze(0)
-            
-            single_sample = ode_fm_solver_sample(
-                model_for_eval, 
-                single_source_image, 
-                n_samples=1,
-                sample_steps=sample_config.sample_steps
-            )
-            
-            generated_samples.append(single_sample.squeeze(0).cpu())
-
-        absl_logging.info("Serial sampling finished. Combining images into a grid.")
-        
-        samples = torch.stack(generated_samples).to(device)
-
-        source_unpreprocessed = data_factory.unpreprocess(source_images_batch)
-        samples_unpreprocessed = data_factory.unpreprocess(samples)
-        target_unpreprocessed = data_factory.unpreprocess(target_images_batch)
-        target_unpreprocessed = target_unpreprocessed * 255
-        comparison_grid = torch.cat([source_unpreprocessed, samples_unpreprocessed, target_unpreprocessed])
-        grid = make_grid(comparison_grid, nrow=n_samples)
-        save_path = os.path.join(config.sample_dir, f'sample_{train_state.step:07d}.png')
-        save_image(grid, save_path)
-        absl_logging.info(f'Saved sample grid to {save_path}')
-
-        model_for_eval.train()
-
     def calculate_iou(pred, label, smooth=1e-6):
-        pred = pred.long()
-        label = label.long()
+        pred = pred.bool()
+        label = label.bool()
         intersection = (pred & label).sum()
         union = (pred | label).sum()
         iou = (intersection.float() + smooth) / (union.float() + smooth)
@@ -329,7 +373,7 @@ def train(config: ml_collections.ConfigDict):
 
             generated_unpreprocessed = data_factory.unpreprocess(generated_images)
             generated_gray = generated_unpreprocessed.mean(dim=1)
-            predicted_masks = (generated_gray > threshold).squeeze(1)
+            predicted_masks = generated_gray > threshold
 
             for i in range(predicted_masks.shape[0]):
                 true_mask = target_masks[i].squeeze()
@@ -347,9 +391,82 @@ def train(config: ml_collections.ConfigDict):
         model_for_eval.train()
         return mean_iou
 
+    def save_latest_checkpoint(best_iou):
+        """Atomically replace the single resumable checkpoint."""
+        latest_save_path = os.path.join(config.ckpt_root, 'latest')
+        temporary_save_path = os.path.join(config.ckpt_root, '.latest_tmp')
+        previous_save_path = os.path.join(config.ckpt_root, '.latest_previous')
+        os.makedirs(config.ckpt_root, exist_ok=True)
+        if os.path.exists(temporary_save_path):
+            shutil.rmtree(temporary_save_path)
+        if os.path.exists(previous_save_path):
+            shutil.rmtree(previous_save_path)
+        os.makedirs(temporary_save_path, exist_ok=True)
+
+        train_state.nnet.save_pretrained(os.path.join(temporary_save_path, 'lora_main'))
+        train_state.nnet_ema.save_pretrained(os.path.join(temporary_save_path, 'lora_ema'))
+        training_state = _build_training_state(train_state, scaler, best_iou, config)
+        torch.save(training_state, os.path.join(temporary_save_path, 'training_state.pt'))
+
+        if os.path.exists(latest_save_path):
+            os.replace(latest_save_path, previous_save_path)
+        try:
+            os.replace(temporary_save_path, latest_save_path)
+        except Exception:
+            if os.path.exists(previous_save_path) and not os.path.exists(latest_save_path):
+                os.replace(previous_save_path, latest_save_path)
+            raise
+        if os.path.exists(previous_save_path):
+            shutil.rmtree(previous_save_path)
+
+        # Remove numbered/final checkpoint layouts used by older versions.
+        # best_model is retained separately for testing.
+        legacy_paths = glob.glob(os.path.join(config.ckpt_root, '[0-9]' * 7))
+        legacy_paths.append(os.path.join(config.ckpt_root, 'final'))
+        for legacy_path in legacy_paths:
+            if os.path.exists(legacy_path):
+                shutil.rmtree(legacy_path)
+        absl_logging.info(
+            f"Saved the single latest checkpoint at step {train_state.step} to {latest_save_path}"
+        )
+
+    def save_best_checkpoint(best_iou):
+        """Replace the best-validation checkpoint used for final testing."""
+        best_save_path = os.path.join(config.ckpt_root, 'best_model')
+        temporary_save_path = os.path.join(config.ckpt_root, '.best_tmp')
+        if os.path.exists(temporary_save_path):
+            shutil.rmtree(temporary_save_path)
+        os.makedirs(temporary_save_path, exist_ok=True)
+        train_state.nnet.save_pretrained(os.path.join(temporary_save_path, 'lora_main'))
+        train_state.nnet_ema.save_pretrained(os.path.join(temporary_save_path, 'lora_ema'))
+        training_state = _build_training_state(train_state, scaler, best_iou, config)
+        torch.save(training_state, os.path.join(temporary_save_path, 'training_state.pt'))
+        if os.path.exists(best_save_path):
+            shutil.rmtree(best_save_path)
+        os.replace(temporary_save_path, best_save_path)
+        absl_logging.info(f"Updated best checkpoint at {best_save_path}")
+
     absl_logging.info(f'Start training from step {train_state.step}...')
     pbar = tqdm(initial=train_state.step, total=config.train.n_steps)
-    best_iou_so_far = 0.0
+    best_iou_so_far = resume_best_iou
+
+    if did_resume and config.train.get('validate_on_resume', False):
+        absl_logging.info("Running validation immediately after checkpoint restoration.")
+        torch.cuda.empty_cache()
+        resume_iou = eval_step(config.sample)
+        torch.cuda.empty_cache()
+        expected_iou = config.train.get('resume_expected_iou', None)
+        if expected_iou is not None:
+            iou_delta = abs(float(resume_iou) - float(expected_iou))
+            tolerance = float(config.train.get('resume_iou_tolerance', 0.02))
+            absl_logging.info(
+                f"Resume validation IoU: {resume_iou:.4f}; expected: {expected_iou:.4f}; "
+                f"absolute delta: {iou_delta:.4f}."
+            )
+            if iou_delta > tolerance:
+                raise RuntimeError(
+                    f"Resume validation delta {iou_delta:.4f} exceeds tolerance {tolerance:.4f}."
+                )
 
     while train_state.step < config.train.n_steps:
         nnet.train()
@@ -373,71 +490,27 @@ def train(config: ml_collections.ConfigDict):
                 log_message += f" | {key}: {val:.6f}"
             absl_logging.info(log_message)
 
-        start_eval_step = config.train.get('start_eval_step', 0)
-        if train_state.step >= start_eval_step and train_state.step % config.train.save_interval == 0:
-            torch.cuda.empty_cache()
-            eval_iou = eval_step(config.sample)
-            torch.cuda.empty_cache()
-
-            periodic_save_dir = os.path.join(config.ckpt_root, f'{train_state.step:07d}')
-            os.makedirs(periodic_save_dir, exist_ok=True)
-            train_state.nnet.save_pretrained(os.path.join(periodic_save_dir, 'lora_main'))
-            train_state.nnet_ema.save_pretrained(os.path.join(periodic_save_dir, 'lora_ema'))
-            
-            periodic_training_state = {
-                'step': train_state.step,
-                'optimizer': train_state.optimizer.state_dict(),
-                'lr_scheduler': train_state.lr_scheduler.state_dict(),
-                'x_embedder': train_state.nnet.flow_model.x_embedder.modules_to_save['default'].state_dict()
-            }
-            torch.save(periodic_training_state, os.path.join(periodic_save_dir, 'training_state.pt'))
-            absl_logging.info(f"Saved periodic checkpoint to {periodic_save_dir}")
-
-            if config.train.get('max_checkpoints_to_keep', -1) > 0:
-                all_ckpts = sorted(glob.glob(os.path.join(config.ckpt_root, '[0-9]'*7)))
-                if len(all_ckpts) > config.train.max_checkpoints_to_keep:
-                    ckpts_to_delete = all_ckpts[:-config.train.max_checkpoints_to_keep]
-                    for ckpt in ckpts_to_delete:
-                        absl_logging.info(f"Removing old checkpoint {ckpt}")
-                        shutil.rmtree(ckpt)
-
-            if eval_iou > best_iou_so_far:
-                absl_logging.info(f"New best model found! IoU improved from {best_iou_so_far:.4f} to {eval_iou:.4f}. Saving checkpoint.")
-                best_iou_so_far = eval_iou
-                
-                best_save_path = os.path.join(config.ckpt_root, 'best_model')
-                os.makedirs(best_save_path, exist_ok=True)
-                
-                lora_main_save_path = os.path.join(best_save_path, 'lora_main')
-                lora_ema_save_path = os.path.join(best_save_path, 'lora_ema')
-                train_state.nnet.save_pretrained(lora_main_save_path)
-                train_state.nnet_ema.save_pretrained(lora_ema_save_path)
-                
-                training_state = {
-                    'step': train_state.step,
-                    'optimizer': train_state.optimizer.state_dict(),
-                    'lr_scheduler': train_state.lr_scheduler.state_dict(),
-                    'x_embedder': train_state.nnet.flow_model.x_embedder.modules_to_save['default'].state_dict()
-                }
-                torch.save(training_state, os.path.join(best_save_path, 'training_state.pt'))
-                
-                absl_logging.info(f'Saved best LoRA checkpoint to {best_save_path}')
-            else:
-                absl_logging.info(f"Model did not improve. Current IoU: {eval_iou:.4f}, Best IoU: {best_iou_so_far:.4f}. Skipping best model save.")
+        if train_state.step % config.train.save_interval == 0:
+            start_eval_step = config.train.get('start_eval_step', 0)
+            if train_state.step >= start_eval_step:
+                torch.cuda.empty_cache()
+                eval_iou = eval_step(config.sample)
+                torch.cuda.empty_cache()
+                if eval_iou > best_iou_so_far:
+                    absl_logging.info(
+                        f"New best IoU: {best_iou_so_far:.4f} -> {eval_iou:.4f}."
+                    )
+                    best_iou_so_far = float(eval_iou)
+                    save_best_checkpoint(best_iou_so_far)
+                else:
+                    absl_logging.info(
+                        f"Current IoU: {eval_iou:.4f}; best IoU: {best_iou_so_far:.4f}."
+                    )
+            save_latest_checkpoint(best_iou_so_far)
 
     pbar.close()
-    final_save_path = os.path.join(config.ckpt_root, 'final')
-    os.makedirs(final_save_path, exist_ok=True)
-    train_state.nnet.save_pretrained(os.path.join(final_save_path, 'lora_main'))
-    train_state.nnet_ema.save_pretrained(os.path.join(final_save_path, 'lora_ema'))
-    final_training_state = {
-        'step': train_state.step,
-        'optimizer': train_state.optimizer.state_dict(),
-        'lr_scheduler': train_state.lr_scheduler.state_dict(),
-        'x_embedder': train_state.nnet.flow_model.x_embedder.modules_to_save['default'].state_dict()
-    }
-    torch.save(final_training_state, os.path.join(final_save_path, 'training_state.pt'))
-    
+    if train_state.step % config.train.save_interval != 0:
+        save_latest_checkpoint(best_iou_so_far)
     absl_logging.info('Training completed!')
 
 def get_config_name():
@@ -447,21 +520,13 @@ def get_config_name():
             return Path(argv[i].split('=')[-1]).stem
     return 'default_config'
 
-def get_hparams():
-    argv = sys.argv
-    lst = []
-    for i in range(1, len(argv)):
-        if argv[i].startswith('--config.') and '=' in argv[i]:
-            if 'path' in argv[i]: continue
-            hparam, val = argv[i].split('=', 1)
-            hparam = hparam.split('.')[-1]
-            lst.append(f'{hparam}={val}')
-    hparams = '-'.join(lst)
-    return hparams if hparams else 'default'
-
 def main(argv):
     config = FLAGS.config
-    config.config_name = "configs/WHU.py"
+    config.config_name = f"configs/{get_config_name()}.py"
+    if FLAGS.workdir:
+        config.workdir = FLAGS.workdir
+        config.ckpt_root = os.path.join(config.workdir, 'checkpoints')
+        config.sample_dir = os.path.join(config.workdir, 'samples')
     train(config)
 
 if __name__ == "__main__":
