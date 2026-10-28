@@ -1,0 +1,15 @@
+# Reference environment: Python 3.10, PyTorch 2.1.2 + CUDA 12.1.
+# Install PyTorch separately, e.g.:
+#   pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+numpy==1.26.0
+einops==0.8.1
+timm==1.0.20
+peft==0.5.0
+transformers==4.38.0
+ml_collections
+absl-py
+opencv-python
+scikit-image==0.25.2
+pillow==11.0.0
+tqdm
+matplotlib
